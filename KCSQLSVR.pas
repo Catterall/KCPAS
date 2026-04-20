@@ -8,6 +8,13 @@ unit KCSQLSVR;
   ----------------------
     Message Broker : Use TMessageQueueThdMgr and TMessageQueueThd instances to
                      listen to message queues.
+
+  Warning:
+  -------------------
+    OnMessageQueueMessage, OnLog, and OnException callbacks are invoked on the
+    worker thread. Handlers MUST be thread-safe or use their own synchronization.
+
+  https://github.com/Catterall/KCPAS
 }
 interface
 
@@ -29,7 +36,7 @@ type
     FConnectionString : string;
     FConnection : TADOConnection;
     FQuery : TADOQuery;
-    procedure Connect;
+    function Connect: Boolean;
     procedure Disconnect;
   private
     FOnMessageQueueMessage : TOnMessageQueueMessage;
@@ -73,7 +80,7 @@ type
     procedure AddMessageQueueThd(aMessageQueueThd: TMessageQueueThd);
     procedure StartAll;
     procedure StopAll;
-    property Count: NativeInt read GetCount;
+    property Count: Integer read GetCount;
   end;
 
   {$ENDREGION}
@@ -101,19 +108,16 @@ end;
 
 destructor TMessageQueueThd.Destroy;
 begin
-  if Assigned(FConnection) then
-  try
-    if FConnection.Connected then
-      FConnection.Close;
-    FreeAndNil(FConnection)
-  except
-    FConnection := nil;
-  end;
+  Disconnect;
   inherited;
 end;
 
-procedure TMessageQueueThd.Connect;
+function TMessageQueueThd.Connect: Boolean;
 begin
+  Result := False;
+
+  Disconnect;
+
   FConnection := TADOConnection.Create(nil);
   FConnection.ConnectionString := FConnectionString;
   FConnection.LoginPrompt := False;
@@ -124,9 +128,10 @@ begin
     begin
       DoError(E);
       Disconnect;
-      Terminate;
+      Exit;
     end;
   end;
+
   FConnection.CommandTimeout := 0;
 
   FQuery := TADOQuery.Create(nil);
@@ -141,6 +146,7 @@ begin
     '), TIMEOUT ' + IntToStr(FWaitTimeoutMs);
 
   DoLog('Connected to SQL Server. Listening on MessageQueue: ' + FMessageQueue);
+  Result := True;
 end;
 
 procedure TMessageQueueThd.Disconnect;
@@ -164,7 +170,12 @@ var
 begin
   CoInitialize(nil);
   try
-    Connect;
+    if not Connect then
+    begin
+      DoLog('Initial connection failed. MessageQueueThd exiting for: ' + FMessageQueue);
+      Exit;
+    end;
+
     try
       while not Terminated do
       begin
@@ -174,7 +185,8 @@ begin
           if (MessageBody <> '') and (not Terminated) then
           begin
             DoLog('Message received: ' + MessageBody);
-            FOnMessageQueueMessage(FMessageQueue, MessageBody);
+            if Assigned(FOnMessageQueueMessage) then
+              FOnMessageQueueMessage(FMessageQueue, MessageBody);
           end;
 
         except
@@ -188,7 +200,13 @@ begin
               Disconnect;
               Sleep(5000);
               if not Terminated then
-                Connect;
+              begin
+                if not Connect then
+                begin
+                  DoLog('Reconnect failed. MessageQueueThd exiting for: ' + FMessageQueue);
+                  Break;
+                end;
+              end;
             end else
               Sleep(1000);
           end;
